@@ -1,4 +1,4 @@
-# PPTX Table Parser
+# PPTX table to Markdown table Converter
 
 Utilities for extracting table XML from PPTX slide XML and converting it to grid JSON.
 

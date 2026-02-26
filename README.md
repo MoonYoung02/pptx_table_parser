@@ -1,4 +1,4 @@
-# PPTX 테이블 파서
+# PPTX table to Markdown table Converter
 
 PPTX 슬라이드 XML에서 테이블 XML을 추출하고, 이를 그리드 JSON으로 변환하는 유틸리티입니다.
 
