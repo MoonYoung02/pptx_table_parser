@@ -35,20 +35,20 @@ NS = {
 REL_NS = {"rel": "http://schemas.openxmlformats.org/package/2006/relationships"}
 
 
-def run_reading_order_stage(
+def run_structure_analysis_stage(
     repo_root: Path,
     slide_xmls: Sequence[Path],
     mode: str,
     surya_dir: Optional[Path],
 ) -> Tuple[Dict[str, Path], Path]:
     if mode == "surya" and surya_dir is None:
-        raise ValueError("reading-order mode 'surya' requires --surya-dir")
+        raise ValueError("structure-analysis mode 'surya' requires --surya-dir")
 
-    ro_script = repo_root / "reading_order" / "extract_reading_order_slide.py"
+    ro_script = repo_root / "structure_analyzer" / "extract_reading_order_slide.py"
     if not ro_script.exists():
         raise FileNotFoundError(f"reading_order script not found: {ro_script}")
 
-    ro_output = Path(tempfile.mkdtemp(prefix=f"reading_order_{mode}_", dir="/tmp"))
+    ro_output = Path(tempfile.mkdtemp(prefix=f"struct_analysis_{mode}_", dir="/tmp"))
     cmd = [
         "python3",
         str(ro_script),
@@ -64,19 +64,23 @@ def run_reading_order_stage(
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         raise RuntimeError(
-            "reading_order stage failed\n"
+            "structure_analysis stage failed\n"
             f"cmd: {' '.join(cmd)}\n"
             f"stdout:\n{proc.stdout}\n"
             f"stderr:\n{proc.stderr}"
         )
 
-    manifest_path = ro_output / "reading_order_manifest.json"
+    manifest_path = ro_output / "structure_analysis_manifest.json"
     if not manifest_path.exists():
-        raise FileNotFoundError(f"reading_order manifest not found: {manifest_path}")
+        legacy_manifest = ro_output / "reading_order_manifest.json"
+        if legacy_manifest.exists():
+            manifest_path = legacy_manifest
+        else:
+            raise FileNotFoundError(f"structure_analysis manifest not found: {manifest_path}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     failed = manifest.get("failed", [])
     if isinstance(failed, list) and failed:
-        raise RuntimeError(f"reading_order stage reported failures: {json.dumps(failed, ensure_ascii=False)}")
+        raise RuntimeError(f"structure_analysis stage reported failures: {json.dumps(failed, ensure_ascii=False)}")
 
     mapping: Dict[str, Path] = {}
     processed = manifest.get("processed", [])
@@ -184,11 +188,13 @@ def slide_base_name(slide_xml: Path) -> str:
 
 
 def find_sidecar_json(slide_xml: Path) -> Optional[Path]:
-    # e.g. slide2.reordered.xml -> slide2.reading_order.json
+    # e.g. slide2.reordered.xml -> slide2.structure_analysis.json
     stem = slide_xml.stem
     candidates = []
     if stem.endswith(".reordered"):
+        candidates.append(slide_xml.with_name(f"{stem[:-len('.reordered')]}.structure_analysis.json"))
         candidates.append(slide_xml.with_name(f"{stem[:-len('.reordered')]}.reading_order.json"))
+    candidates.append(slide_xml.with_name(f"{stem}.structure_analysis.json"))
     candidates.append(slide_xml.with_name(f"{stem}.reading_order.json"))
     for c in candidates:
         if c.exists() and c.is_file():
@@ -198,7 +204,7 @@ def find_sidecar_json(slide_xml: Path) -> Optional[Path]:
 
 def load_heading_hints(slide_xml: Path) -> Dict[str, Dict[str, object]]:
     """
-    Load heading hints produced by reading_order stage.
+    Load heading hints produced by structure analysis stage.
     key: shape_id (string)
     value: subset of hint fields
     """
@@ -209,7 +215,9 @@ def load_heading_hints(slide_xml: Path) -> Dict[str, Dict[str, object]]:
         payload = json.loads(sidecar.read_text(encoding="utf-8"))
     except Exception:
         return {}
-    rows = payload.get("reading_order")
+    rows = payload.get("structure_order")
+    if not isinstance(rows, list):
+        rows = payload.get("reading_order")
     if not isinstance(rows, list):
         return {}
     out: Dict[str, Dict[str, object]] = {}
@@ -558,31 +566,31 @@ def main() -> int:
             "name": pkg_name,
             "slides": [],
             "result_md": str(pkg_out / "result.md"),
-            "reading_order_mode": args.reading_order,
+            "structure_analysis_mode": args.reading_order,
         }
 
         all_chunks: List[str] = []
         try:
-            ro_map, ro_output = run_reading_order_stage(
+            ro_map, ro_output = run_structure_analysis_stage(
                 repo_root=repo_root,
                 slide_xmls=slide_xmls,
                 mode=args.reading_order,
                 surya_dir=surya_dir,
             )
-            pkg_row["reading_order_output_dir"] = str(ro_output)
+            pkg_row["structure_analysis_output_dir"] = str(ro_output)
         except Exception as e:  # noqa: BLE001
             for slide_xml in slide_xmls:
                 row = {
                     "page": parse_slide_number(slide_xml.name, 0),
                     "source_xml": str(slide_xml),
                     "status": "failed",
-                    "error": f"reading_order stage failed: {e}",
+                    "error": f"structure_analysis stage failed: {e}",
                     "warnings": [],
                 }
                 pkg_row["slides"].append(row)
                 manifest["summary"]["failed"] += 1
             manifest["packages"].append(pkg_row)
-            print(f"[{pkg_name}] reading_order failed: {e}")
+            print(f"[{pkg_name}] structure_analysis failed: {e}")
             continue
 
         for i, slide_xml in enumerate(slide_xmls, 1):
@@ -591,7 +599,7 @@ def main() -> int:
             row = {
                 "page": page_no,
                 "source_xml": str(slide_xml),
-                "reading_order_xml": str(ordered_slide_xml),
+                "structure_analysis_xml": str(ordered_slide_xml),
                 "status": "ok",
                 "warnings": [],
             }
