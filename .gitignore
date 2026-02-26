@@ -7,3 +7,8 @@
 /table_extractor/target_slides/*.xml
 /table_parser/parsing_results/*.json
 /table_parser/tables/*.md
+*.xml
+*.json
+*.md
+!/README.md
+!/README.eg.md
