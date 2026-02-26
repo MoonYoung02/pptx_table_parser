@@ -3,5 +3,7 @@
 
 # Do not commit local XML,JSON sources/results
 /table_extractor/extract_results/*.xml
+/table_extractor/extract_results/manifest.json
 /table_extractor/target_slides/*.xml
 /table_parser/parsing_results/*.json
+/table_parser/tables/*.md
