@@ -12,6 +12,11 @@ Utilities for extracting table XML from PPTX slide XML and converting it to grid
   - Parses extracted table XML into JSON grid format.
   - Output: `table_parser/parsing_results/<input_stem>_grid.json`
 
+- `table_parser/tableMaker.py`
+  - Renders table JSON into Markdown/HTML/CSV.
+  - In batch mode (no input argument), converts `table_parser/parsing_results/*.json`
+    into `table_parser/tables/*.md`.
+
 ## Requirements
 
 - Python 3.10+ (3.11+ recommended)
@@ -49,6 +54,23 @@ python3 table_parser/parse_table.py
 ```
 
 Default mode reads all `*.xml` in `table_extractor/extract_results/`.
+
+### 3) Render JSON to table (`tableMaker.py`)
+
+Convert a single JSON file:
+
+```bash
+python3 table_parser/tableMaker.py table_parser/parsing_results/slide2_0001_grid.json
+```
+
+Run with no arguments (batch mode):
+
+```bash
+python3 table_parser/tableMaker.py
+```
+
+Batch mode converts `table_parser/parsing_results/*.json` (excluding `manifest.json`)
+to `table_parser/tables/*.md`.
 
 ## Notes
 

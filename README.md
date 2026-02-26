@@ -12,6 +12,11 @@ PPTX 슬라이드 XML에서 테이블 XML을 추출하고, 이를 그리드 JSON
   - 추출된 테이블 XML을 JSON 그리드 형태로 파싱합니다.
   - 출력: `table_parser/parsing_results/<input_stem>_grid.json`
 
+- `table_parser/tableMaker.py`
+  - 테이블 JSON을 Markdown/HTML/CSV로 렌더링합니다.
+  - 배치(인자 없음) 실행 시 `table_parser/parsing_results/*.json`을
+    `table_parser/tables/*.md`로 변환합니다.
+
 ## 요구사항
 
 - Python 3.10+ (권장 3.11+)
@@ -50,9 +55,25 @@ python3 table_parser/parse_table.py
 
 기본 모드에서는 `table_extractor/extract_results/`의 모든 `*.xml`을 처리합니다.
 
+### 3) JSON -> 테이블 렌더링 (`tableMaker.py`)
+
+단일 JSON 파일 변환:
+
+```bash
+python3 table_parser/tableMaker.py table_parser/parsing_results/slide2_0001_grid.json
+```
+
+인자 없이 실행(배치 모드):
+
+```bash
+python3 table_parser/tableMaker.py
+```
+
+배치 모드에서는 `table_parser/parsing_results/*.json`(manifest 제외)을
+`table_parser/tables/*.md`로 변환합니다.
+
 ## 참고
 
 - 진행 로그는 `SCRIPT`와 `WRITE` 단계로 구분되어 출력됩니다.
 - 출력 폴더가 없으면 자동 생성됩니다.
 - 각 출력 폴더에는 `manifest.json`이 생성됩니다.
-
