@@ -5,7 +5,7 @@ Extract reading order per slide XML and write:
 2) reordered slide XML
 
 Usage:
-  python extract_reading_order_slide.py [slide1.xml slide2.xml ...]
+  python extract_structure_analysis.py [slide1.xml slide2.xml ...]
 
 If no positional args are given, all *.xml in ./target_slides are processed.
 Outputs are always written to ./output (created automatically if missing).
@@ -57,8 +57,18 @@ class SlideObject:
     is_decorative: bool
     is_heading: bool
     is_title_placeholder: bool
-    is_duplicate_title: bool = False
-    surya_rank: Optional[int] = None
+    bbox: Optional[Tuple[int, int, int, int]] = None
+
+
+@dataclass
+class OrderContext:
+    slide_left: int
+    slide_top: int
+    slide_right: int
+    slide_bottom: int
+    slide_width: int
+    slide_height: int
+    title_band_bottom: int
 
 
 def local_name(tag: str) -> str:
@@ -132,6 +142,35 @@ def first_off(elem: ET.Element) -> Optional[ET.Element]:
         if off is not None:
             return off
     return None
+
+
+def first_ext(elem: ET.Element) -> Optional[ET.Element]:
+    for p in (
+        "./p:spPr/a:xfrm/a:ext",
+        "./p:grpSpPr/a:xfrm/a:ext",
+        "./p:xfrm/a:ext",
+        ".//a:ext",
+    ):
+        ext = elem.find(p, NS)
+        if ext is not None:
+            return ext
+    return None
+
+
+def extract_bbox_emu(elem: ET.Element) -> Optional[Tuple[int, int, int, int]]:
+    off = first_off(elem)
+    ext = first_ext(elem)
+    if off is None or ext is None:
+        return None
+    x = parse_int(off.attrib.get("x"))
+    y = parse_int(off.attrib.get("y"))
+    w = parse_int(ext.attrib.get("cx"))
+    h = parse_int(ext.attrib.get("cy"))
+    if any(v >= 10**18 for v in (x, y, w, h)):
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    return (x, y, x + w, y + h)
 
 
 def resolve_slide_layout(slide_xml: Path) -> Optional[Path]:
@@ -218,293 +257,207 @@ def is_decorative(tag: str, text: str) -> bool:
     return False
 
 
-def parse_float(v: Any, default: float = 0.0) -> float:
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return default
+def object_left(obj: SlideObject) -> int:
+    if obj.bbox is not None:
+        return obj.bbox[0]
+    return obj.x
 
 
-def parse_bbox(raw: Any) -> Optional[Tuple[float, float, float, float]]:
-    if isinstance(raw, dict):
-        keys = ("x1", "y1", "x2", "y2")
-        if all(k in raw for k in keys):
-            x1 = parse_float(raw.get("x1"))
-            y1 = parse_float(raw.get("y1"))
-            x2 = parse_float(raw.get("x2"))
-            y2 = parse_float(raw.get("y2"))
-            return (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
-        return None
-
-    if not isinstance(raw, list):
-        return None
-    if len(raw) == 4 and all(isinstance(x, (int, float)) for x in raw):
-        x1, y1, x2, y2 = (float(raw[0]), float(raw[1]), float(raw[2]), float(raw[3]))
-        return (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
-    if len(raw) == 4 and all(isinstance(x, list) and len(x) >= 2 for x in raw):
-        xs = [parse_float(p[0]) for p in raw]
-        ys = [parse_float(p[1]) for p in raw]
-        return (min(xs), min(ys), max(xs), max(ys))
-    return None
+def object_top(obj: SlideObject) -> int:
+    if obj.bbox is not None:
+        return obj.bbox[1]
+    return obj.y
 
 
-def bbox_center_xy(x1: float, y1: float, x2: float, y2: float) -> Tuple[float, float]:
-    return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+def reading_top(obj: SlideObject, context: OrderContext) -> int:
+    top = object_top(obj)
+    if top >= 10**18 and is_top_title_object(obj, context):
+        return context.slide_top - max(250000, int(context.slide_height * 0.08))
+    return top
 
 
-def normalize_xy(x: float, y: float, max_x: float, max_y: float) -> Tuple[float, float]:
-    nx = (x / max_x) if max_x > 0 else 0.0
-    ny = (y / max_y) if max_y > 0 else 0.0
-    return (nx, ny)
+def object_right(obj: SlideObject) -> int:
+    if obj.bbox is not None:
+        return obj.bbox[2]
+    width = max(500000, min(2500000, 80000 * max(1, len(obj.normalized))))
+    return object_left(obj) + width
 
 
-def find_surya_json(slide_xml: Path, surya_dir: Path) -> Optional[Path]:
-    stem = slide_xml.stem
-    candidates = [
-        surya_dir / f"{stem}.json",
-        surya_dir / f"{slide_xml.name}.json",
-    ]
-    for c in candidates:
-        if c.exists() and c.is_file():
-            return c
-
-    wildcard_hits = sorted(surya_dir.glob(f"*{stem}*.json"), key=lambda p: p.name.lower())
-    for c in wildcard_hits:
-        if c.is_file():
-            return c
-    return None
+def object_bottom(obj: SlideObject) -> int:
+    if obj.bbox is not None:
+        return obj.bbox[3]
+    return object_top(obj) + object_height(obj)
 
 
-def _looks_surya_block(node: Dict[str, Any]) -> bool:
-    if parse_bbox(node.get("bbox")) is not None:
+def object_width(obj: SlideObject) -> int:
+    return max(1, object_right(obj) - object_left(obj))
+
+
+def object_height(obj: SlideObject) -> int:
+    if obj.bbox is not None:
+        return max(1, obj.bbox[3] - obj.bbox[1])
+    if obj.tag == "pic":
+        return 1800000
+    if obj.tag == "graphicFrame":
+        return 1200000
+    lines = max(1, len(re.findall(r"[.!?]|[\u3002]", obj.text)) + 1)
+    return max(250000, min(1800000, 250000 * lines))
+
+
+def build_order_context(objects: Sequence[SlideObject]) -> OrderContext:
+    candidates = [o for o in objects if not o.is_footer and not o.is_decorative]
+    if not candidates:
+        candidates = list(objects)
+
+    if candidates:
+        slide_left = min(object_left(o) for o in candidates)
+        slide_top = min(object_top(o) for o in candidates)
+        slide_right = max(object_right(o) for o in candidates)
+        slide_bottom = max(object_bottom(o) for o in candidates)
+    else:
+        slide_left = slide_top = 0
+        slide_right = slide_bottom = 1
+
+    slide_width = max(1, slide_right - slide_left)
+    slide_height = max(1, slide_bottom - slide_top)
+    title_band_bottom = slide_top + max(600000, int(slide_height * 0.22))
+    return OrderContext(
+        slide_left=slide_left,
+        slide_top=slide_top,
+        slide_right=slide_right,
+        slide_bottom=slide_bottom,
+        slide_width=slide_width,
+        slide_height=slide_height,
+        title_band_bottom=title_band_bottom,
+    )
+
+
+def is_full_width_body(obj: SlideObject, context: OrderContext) -> bool:
+    if not obj.normalized:
+        return False
+    width_ratio = object_width(obj) / max(1, context.slide_width)
+    height_ratio = object_height(obj) / max(1, context.slide_height)
+    return width_ratio >= 0.58 and (height_ratio >= 0.12 or len(obj.normalized) >= 90)
+
+
+def is_top_title_object(obj: SlideObject, context: OrderContext) -> bool:
+    if obj.is_footer or obj.is_decorative:
+        return False
+    top = object_top(obj)
+    if obj.ph_type in TITLE_TYPES:
         return True
-    if parse_bbox(node.get("polygon")) is not None:
+    if obj.is_title_placeholder:
         return True
+    if obj.coord_source == "layout" and obj.ph_type is not None and top <= context.title_band_bottom:
+        return len(obj.normalized) <= 100
     return False
 
 
-def _collect_surya_blocks(node: Any, out: List[Dict[str, Any]]) -> None:
-    if isinstance(node, dict):
-        if _looks_surya_block(node):
-            out.append(node)
-        for v in node.values():
-            _collect_surya_blocks(v, out)
-        return
-    if isinstance(node, list):
-        for item in node:
-            _collect_surya_blocks(item, out)
+def is_promotable_numbered_heading(obj: SlideObject, context: OrderContext) -> bool:
+    if not is_numbered_heading_text(obj.text):
+        return False
+    if obj.is_footer or obj.is_decorative:
+        return False
+    if is_full_width_body(obj, context):
+        return False
+    top = object_top(obj)
+    if top > context.slide_top + int(context.slide_height * 0.45):
+        return False
+    if object_height(obj) > int(context.slide_height * 0.18):
+        return False
+    if len(obj.normalized) > 90:
+        return False
+    return True
 
 
-def load_surya_blocks(slide_xml: Path, surya_dir: Path) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    surya_json = find_surya_json(slide_xml, surya_dir)
-    if surya_json is None:
-        raise FileNotFoundError(f"surya result not found for {slide_xml.name} under {surya_dir}")
-
-    payload = json.loads(surya_json.read_text(encoding="utf-8"))
-    raw_blocks: List[Dict[str, Any]] = []
-    _collect_surya_blocks(payload, raw_blocks)
-
-    parsed: List[Dict[str, Any]] = []
-    for row in raw_blocks:
-        bbox = parse_bbox(row.get("bbox"))
-        if bbox is None:
-            bbox = parse_bbox(row.get("polygon"))
-        if bbox is None:
-            continue
-
-        label_raw = row.get("label") or row.get("type") or row.get("class") or row.get("category")
-        text_raw = row.get("text") or row.get("value") or row.get("content") or ""
-        position = row.get("position")
-
-        label = str(label_raw).strip() if label_raw is not None else ""
-        text = str(text_raw).strip() if text_raw is not None else ""
-
-        x1, y1, x2, y2 = bbox
-        cx, cy = bbox_center_xy(x1, y1, x2, y2)
-        parsed.append(
-            {
-                "bbox": [x1, y1, x2, y2],
-                "cx": cx,
-                "cy": cy,
-                "label": label,
-                "text": text,
-                "position": parse_int(str(position), default=10**18) if position is not None else 10**18,
-            }
-        )
-
-    parsed.sort(key=lambda b: (b["position"], b["cy"], b["cx"]))
-    for i, b in enumerate(parsed):
-        if b["position"] >= 10**18:
-            b["position"] = i
-
-    return parsed, {"surya_json": str(surya_json), "surya_block_count": len(parsed)}
-
-
-def heading_depth_from_text_label(text: str, label: str) -> Optional[int]:
-    raw = re.sub(r"\s+", " ", (text or "").strip())
-    low_label = (label or "").lower()
-    if not raw and "header" not in low_label and "title" not in low_label:
-        return None
-
-    if re.match(r"^\d+\.\d+(?:\.\d+)*\.?\s+", raw):
-        return 3
-    if re.match(r"^\d+[.)]\s+", raw):
-        return 2
-    if any(k in low_label for k in ("section-header", "header", "title")):
-        return 1
-    if len(raw) <= 80:
-        return 1
-    return None
-
-
-def apply_surya_ordering(objects: List[SlideObject], blocks: List[Dict[str, Any]]) -> List[SlideObject]:
-    if not objects:
-        return objects
-    if not blocks:
-        return objects
-
-    finite_x = [float(o.x) for o in objects if o.x < 10**18]
-    finite_y = [float(o.y) for o in objects if o.y < 10**18]
-    max_xml_x = max(finite_x) if finite_x else 1.0
-    max_xml_y = max(finite_y) if finite_y else 1.0
-
-    max_surya_x = max(float(b["bbox"][2]) for b in blocks) if blocks else 1.0
-    max_surya_y = max(float(b["bbox"][3]) for b in blocks) if blocks else 1.0
-
-    assigned: Dict[int, Dict[str, Any]] = {}
-    for blk in blocks:
-        bx, by = normalize_xy(float(blk["cx"]), float(blk["cy"]), max_surya_x, max_surya_y)
-
-        best_i = -1
-        best_dist = float("inf")
-        for i, obj in enumerate(objects):
-            ox, oy = normalize_xy(float(obj.x if obj.x < 10**18 else max_xml_x), float(obj.y if obj.y < 10**18 else max_xml_y), max_xml_x, max_xml_y)
-            d = (ox - bx) ** 2 + (oy - by) ** 2
-            if d < best_dist:
-                best_dist = d
-                best_i = i
-        if best_i < 0:
-            continue
-
-        prev = assigned.get(best_i)
-        if prev is None or int(blk["position"]) < int(prev["position"]):
-            assigned[best_i] = blk
-
-    out: List[SlideObject] = []
-    for i, obj in enumerate(objects):
-        blk = assigned.get(i)
-        text = blk["text"] if blk and blk.get("text") else obj.text
-        label = blk["label"] if blk else ""
-        depth = heading_depth_from_text_label(text, label)
-        is_heading = depth is not None
-        out.append(
-            SlideObject(
-                shape_id=obj.shape_id,
-                xml_index=obj.xml_index,
-                tag=obj.tag,
-                name=obj.name,
-                ph_type=obj.ph_type,
-                ph_idx=obj.ph_idx,
-                x=obj.x,
-                y=obj.y,
-                coord_source="surya",
-                text=text,
-                normalized=normalize_text(text),
-                is_footer=obj.is_footer,
-                is_decorative=obj.is_decorative,
-                is_heading=is_heading,
-                is_title_placeholder=obj.is_title_placeholder,
-                is_duplicate_title=False,
-                surya_rank=(int(blk["position"]) if blk else None),
-            )
-        )
-    detect_duplicate_titles(out)
-    return out
-
-
-def detect_duplicate_titles(objs: List[SlideObject]) -> None:
-    numbered = [o for o in objs if o.is_heading and is_numbered_heading_text(o.text)]
-    if not numbered:
-        return
-
-    for obj in objs:
-        if not obj.is_title_placeholder:
-            continue
-        ts = token_set(obj.text)
-        if not ts:
-            continue
-        for heading in numbered:
-            hs = token_set(heading.text)
-            if not hs:
-                continue
-            inter = len(ts & hs)
-            union = len(ts | hs)
-            jaccard = (inter / union) if union else 0.0
-            if jaccard >= 0.55:
-                obj.is_duplicate_title = True
-                break
-
-
-def bucket(obj: SlideObject) -> int:
+def bucket(obj: SlideObject, context: OrderContext) -> int:
     if obj.is_footer:
         return 4
     if obj.is_decorative:
         return 5
-    if obj.is_heading and is_numbered_heading_text(obj.text):
+    if is_top_title_object(obj, context):
         return 0
-    if obj.is_heading and not obj.is_duplicate_title:
+    if is_promotable_numbered_heading(obj, context):
         return 1
-    if obj.is_duplicate_title:
-        return 3
     return 2
 
 
-def reason(obj: SlideObject) -> str:
+def reason(obj: SlideObject, context: OrderContext) -> str:
     if obj.is_footer:
         return "Footer or slide number placeholder"
     if obj.is_decorative:
         return "Decorative connector/shape, low reading priority"
-    if obj.is_heading and is_numbered_heading_text(obj.text):
-        return "Numbered section heading pattern"
-    if obj.is_heading and not obj.is_duplicate_title:
+    if is_top_title_object(obj, context):
         if obj.coord_source == "layout":
             return "Title placeholder with layout-inherited coordinates"
-        return "Short title-like text block"
-    if obj.is_duplicate_title:
-        return "Duplicate of a section heading title placeholder"
+        return "Title/layout placeholder promoted in top title band"
+    if is_promotable_numbered_heading(obj, context):
+        return "Short numbered heading promoted by position and size"
     if obj.tag == "graphicFrame":
         return "Table/chart frame as a body block"
     if obj.tag == "pic":
         return "Image block (no text)"
-    return "General body text block (y->x)"
+    if is_full_width_body(obj, context):
+        return "Full-width body block kept in spatial order"
+    return "General body block ordered by row clustering"
 
 
-def heading_depth_hint(obj: SlideObject) -> Optional[int]:
-    # Final markdown depth hint should be emitted by converter.
-    # Here we provide structural hints only.
-    if obj.is_duplicate_title:
-        return None
-    if obj.is_heading and is_numbered_heading_text(obj.text):
-        raw = re.sub(r"\s+", " ", (obj.text or "").strip())
-        t = normalize_text(obj.text)
-        if re.match(r"^\d+\)\s+", raw):
-            return 2
-        if re.match(r"^\d+\.\d+(?:\.\d+)*\.?\s+", t):
-            return 3
-        if re.match(r"^\d+\.\s+", t):
-            return 2
-    if obj.is_heading and not obj.is_duplicate_title:
-        return 1
+def numbered_heading_kind(text: str) -> Optional[str]:
+    raw = re.sub(r"\s+", " ", (text or "").strip())
+    t = normalize_text(text)
+    if re.match(r"^\d+\)\s+", raw):
+        return "paren"
+    if re.match(r"^\d+\.\d+(?:\.\d+)*\.?\s+", t):
+        return "dotted-multi"
+    if re.match(r"^\d+\.\s+", t):
+        return "dotted-single"
     return None
+
+
+def compute_heading_depths(
+    ordered_objects: Sequence[SlideObject],
+    context: OrderContext,
+) -> Dict[str, Optional[int]]:
+    depths: Dict[str, Optional[int]] = {}
+    seen_title = False
+    last_section_depth: Optional[int] = None
+
+    for obj in ordered_objects:
+        depth: Optional[int] = None
+        kind = numbered_heading_kind(obj.text) if obj.is_heading else None
+
+        if is_top_title_object(obj, context):
+            depth = 1
+            seen_title = True
+            last_section_depth = 1
+        elif obj.is_heading:
+            if kind == "dotted-multi":
+                depth = 2 if seen_title else 1
+                last_section_depth = depth
+            elif kind == "dotted-single":
+                depth = 2 if seen_title else 1
+                last_section_depth = depth
+            elif kind == "paren":
+                if last_section_depth is not None:
+                    depth = min(last_section_depth + 1, 3)
+                elif seen_title:
+                    depth = 2
+                else:
+                    depth = 1
+            else:
+                depth = 2 if seen_title else 1
+                last_section_depth = depth
+
+        depths[obj.shape_id] = depth
+
+    return depths
 
 
 def heading_score(obj: SlideObject) -> float:
     # Confidence-like score for heading candidacy.
-    if obj.is_duplicate_title:
-        return 0.2
     if obj.is_heading and is_numbered_heading_text(obj.text):
         return 0.95
-    if obj.is_heading and not obj.is_duplicate_title:
+    if obj.is_heading:
         return 0.75
     return 0.0
 
@@ -521,8 +474,15 @@ def confidence(objs: Sequence[SlideObject]) -> str:
     return "high"
 
 
-def object_to_dict(o: SlideObject) -> Dict[str, object]:
-    depth = heading_depth_hint(o)
+def object_to_dict(
+    o: SlideObject,
+    context: OrderContext,
+    heading_depths: Optional[Dict[str, Optional[int]]] = None,
+) -> Dict[str, object]:
+    if heading_depths is None:
+        depth = compute_heading_depths([o], context).get(o.shape_id)
+    else:
+        depth = heading_depths.get(o.shape_id)
     score = heading_score(o)
     is_candidate = depth is not None and score >= 0.7
     return {
@@ -540,13 +500,12 @@ def object_to_dict(o: SlideObject) -> Dict[str, object]:
         "is_decorative": o.is_decorative,
         "is_heading": o.is_heading,
         "is_title_placeholder": o.is_title_placeholder,
-        "is_duplicate_title": o.is_duplicate_title,
         "is_heading_candidate": is_candidate,
         "heading_score": round(score, 3),
         "heading_depth_hint": depth,
-        "surya_rank": o.surya_rank,
-        "bucket": bucket(o),
-        "reason": reason(o),
+        "bbox": list(o.bbox) if o.bbox is not None else None,
+        "bucket": bucket(o, context),
+        "reason": reason(o, context),
     }
 
 
@@ -560,6 +519,8 @@ def extract_slide_objects_xml(slide_xml: Path) -> Tuple[List[SlideObject], Dict[
     layout_map = parse_layout_placeholders(layout_xml)
 
     objects: List[SlideObject] = []
+    xml_tables: List[Dict[str, object]] = []
+    xml_images: List[Dict[str, object]] = []
     xml_idx = 0
     for ch in list(sp_tree):
         tag = local_name(ch.tag)
@@ -575,12 +536,16 @@ def extract_slide_objects_xml(slide_xml: Path) -> Tuple[List[SlideObject], Dict[
         name = c_nv_pr.attrib.get("name", "") if c_nv_pr is not None else ""
         ph_type = ph.attrib.get("type") if ph is not None else None
         ph_idx = ph.attrib.get("idx") if ph is not None else None
+        bbox = extract_bbox_emu(ch)
 
         off = first_off(ch)
         coord_source = "direct"
         if off is not None:
             x = parse_int(off.attrib.get("x"))
             y = parse_int(off.attrib.get("y"))
+        elif bbox is not None:
+            x = bbox[0]
+            y = bbox[1]
         else:
             x = 10**18
             y = 10**18
@@ -621,13 +586,33 @@ def extract_slide_objects_xml(slide_xml: Path) -> Tuple[List[SlideObject], Dict[
                 is_decorative=is_decorative(tag, text),
                 is_heading=looks_heading(text, ph_type, tag),
                 is_title_placeholder=ph_type in TITLE_TYPES,
+                bbox=bbox,
             )
         )
+        if bbox is not None and tag == "pic":
+            xml_images.append(
+                {
+                    "shape_id": shape_id,
+                    "name": name,
+                    "bbox": list(bbox),
+                    "tag": tag,
+                }
+            )
+        if bbox is not None and tag == "graphicFrame" and (ch.find(".//a:tbl", NS) is not None):
+            xml_tables.append(
+                {
+                    "shape_id": shape_id,
+                    "name": name,
+                    "bbox": list(bbox),
+                    "tag": tag,
+                }
+            )
 
-    detect_duplicate_titles(objects)
     meta = {
         "layout_xml": str(layout_xml) if layout_xml else None,
         "layout_placeholder_count": len(layout_map),
+        "xml_tables": xml_tables,
+        "xml_images": xml_images,
     }
     return objects, meta
 
@@ -635,37 +620,89 @@ def extract_slide_objects_xml(slide_xml: Path) -> Tuple[List[SlideObject], Dict[
 def extract_slide_objects(
     slide_xml: Path,
     mode: str,
-    surya_dir: Optional[Path],
 ) -> Tuple[List[SlideObject], Dict[str, object]]:
     objects, meta = extract_slide_objects_xml(slide_xml)
-    if mode == "xml":
-        meta["mode"] = "xml"
-        return objects, meta
-
-    if surya_dir is None:
-        raise ValueError("surya mode requires --surya-dir")
-    blocks, surya_meta = load_surya_blocks(slide_xml, surya_dir)
-    if not blocks:
-        raise ValueError(f"surya mode has no usable blocks for {slide_xml.name}")
-
-    mapped = apply_surya_ordering(objects, blocks)
-    meta.update(surya_meta)
-    meta["mode"] = "surya"
-    return mapped, meta
+    meta["mode"] = mode
+    return objects, meta
 
 
-def order_objects(objects: Sequence[SlideObject]) -> List[SlideObject]:
-    return sorted(
-        objects,
+def order_objects(objects: Sequence[SlideObject], mode: str) -> List[SlideObject]:
+    context = build_order_context(objects)
+    tail = [o for o in objects if bucket(o, context) >= 4]
+    main = [o for o in objects if bucket(o, context) < 4]
+
+    seed = sorted(
+        main,
         key=lambda o: (
-            0 if o.surya_rank is not None else 1,
-            o.surya_rank if o.surya_rank is not None else 10**18,
-            bucket(o),
-            o.y,
-            o.x,
+            reading_top(o, context),
+            object_left(o),
             o.xml_index,
         ),
     )
+
+    rows: List[Dict[str, object]] = []
+    for obj in seed:
+        top = reading_top(obj, context)
+        left = object_left(obj)
+        height = object_height(obj)
+        placed = False
+        for row in rows:
+            anchor_top = int(row["anchor_top"])
+            row_height = int(row["max_height"])
+            tolerance = max(160000, int(min(row_height, height) * 0.35))
+            if abs(top - anchor_top) <= tolerance:
+                row["objects"].append(obj)
+                row["tops"].append(top)
+                row["lefts"].append(left)
+                row["anchor_top"] = min(row["tops"])
+                row["max_height"] = max(row_height, height)
+                placed = True
+                break
+        if not placed:
+            rows.append(
+                {
+                    "objects": [obj],
+                    "tops": [top],
+                    "lefts": [left],
+                    "anchor_top": top,
+                    "max_height": height,
+                }
+            )
+
+    def row_key(row: Dict[str, object]) -> Tuple[int, int, int, int]:
+        row_objects = row["objects"]
+        return (
+            int(row["anchor_top"]),
+            min(object_left(obj) for obj in row_objects),
+            min(bucket(obj, context) for obj in row_objects),
+            min(obj.xml_index for obj in row_objects),
+        )
+
+    ordered: List[SlideObject] = []
+    for row in sorted(rows, key=row_key):
+        row_objects = sorted(
+            row["objects"],
+            key=lambda obj: (
+                bucket(obj, context),
+                object_left(obj),
+                reading_top(obj, context),
+                obj.xml_index,
+            ),
+        )
+        ordered.extend(row_objects)
+
+    ordered.extend(
+        sorted(
+            tail,
+            key=lambda o: (
+                bucket(o, context),
+                reading_top(o, context),
+                object_left(o),
+                o.xml_index,
+            ),
+        )
+    )
+    return ordered
 
 
 def reorder_tree_by_indexes(tree: ET.ElementTree, ordered_xml_indexes: Sequence[int]) -> None:
@@ -731,10 +768,12 @@ def write_outputs(
     slide_xml: Path,
     output_dir: Path,
     mode: str,
-    surya_dir: Optional[Path],
 ) -> Dict[str, object]:
-    objects, meta = extract_slide_objects(slide_xml, mode=mode, surya_dir=surya_dir)
-    ordered = order_objects(objects)
+    objects, meta = extract_slide_objects(slide_xml, mode=mode)
+    context = build_order_context(objects)
+    ordered = order_objects(objects, mode=mode)
+    ordered_heading_depths = compute_heading_depths(ordered, context)
+    raw_heading_depths = compute_heading_depths(sorted(objects, key=lambda x: x.xml_index), context)
 
     ordered_indexes = [obj.xml_index for obj in ordered]
 
@@ -742,14 +781,13 @@ def write_outputs(
     reorder_tree_by_indexes(tree, ordered_indexes)
 
     stem = slide_xml.stem
-    json_path = output_dir / f"{stem}.reading_order.json"
+    json_path = output_dir / f"{stem}.structure_analysis.json"
     xml_path = output_dir / f"{stem}.reordered.xml"
 
     report: Dict[str, object] = {
         "input_xml": str(slide_xml),
         "mode": mode,
         "layout_xml": meta.get("layout_xml"),
-        "surya_json": meta.get("surya_json"),
         "confidence": confidence(objects),
         "counts": {
             "total": len(objects),
@@ -759,13 +797,17 @@ def write_outputs(
             "footer": sum(1 for o in objects if o.is_footer),
             "decorative": sum(1 for o in objects if o.is_decorative),
             "layout_coord_used": sum(1 for o in objects if o.coord_source == "layout"),
-            "surya_ranked": sum(1 for o in objects if o.surya_rank is not None),
-            "surya_blocks": int(meta.get("surya_block_count", 0)),
+            "xml_tables": len(meta.get("xml_tables", [])),
+            "xml_images": len(meta.get("xml_images", [])),
         },
-        "reading_order": [object_to_dict(o) for o in ordered],
-        "raw_xml_order": [object_to_dict(o) for o in sorted(objects, key=lambda x: x.xml_index)],
+        "xml_tables": meta.get("xml_tables", []),
+        "xml_images": meta.get("xml_images", []),
+        "structure_order": [object_to_dict(o, context, ordered_heading_depths) for o in ordered],
+        "raw_xml_order": [
+            object_to_dict(o, context, raw_heading_depths) for o in sorted(objects, key=lambda x: x.xml_index)
+        ],
         "ordered_xml_indexes": ordered_indexes,
-        "output_reordered_xml": str(xml_path),
+        "output_structure_xml": str(xml_path),
     }
 
     json_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -791,14 +833,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--mode",
-        choices=("xml", "surya"),
+        choices=("xml",),
         default="xml",
-        help="Reading order mode. xml=legacy XML heuristics, surya=Surya OCR/layout based.",
-    )
-    parser.add_argument(
-        "--surya-dir",
-        default=None,
-        help="Directory containing Surya per-slide JSON outputs. Required in --mode surya.",
+        help="Reading order mode. Only xml mode is supported.",
     )
     parser.add_argument(
         "--output-dir",
@@ -810,7 +847,6 @@ def main() -> None:
     target_dir = Path("./target_slides")
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    surya_dir = Path(args.surya_dir).resolve() if args.surya_dir else None
 
     ET.register_namespace("a", NS["a"])
     ET.register_namespace("p", NS["p"])
@@ -826,14 +862,14 @@ def main() -> None:
 
     for slide_xml in sorted(inputs, key=natural_key):
         try:
-            row = write_outputs(slide_xml, output_dir, mode=args.mode, surya_dir=surya_dir)
+            row = write_outputs(slide_xml, output_dir, mode=args.mode)
             manifest["processed"].append(row)
             print(f"Processed: {slide_xml.name}")
         except Exception as e:  # noqa: BLE001
             manifest["failed"].append({"input_xml": str(slide_xml), "error": str(e)})
             print(f"Failed: {slide_xml.name} -> {e}")
 
-    manifest_path = output_dir / "reading_order_manifest.json"
+    manifest_path = output_dir / "structure_analysis_manifest.json"
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print(f"Wrote manifest: {manifest_path.resolve()}")

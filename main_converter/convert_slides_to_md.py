@@ -3,11 +3,14 @@
 Convert extracted PPTX package(s) to markdown.
 
 Usage:
-  python convert_slides_to_md.py [ppt_root_dir ...]
+  python convert_slides_to_md.py [ppt_root_dir|file.pptx ...]
+  python convert_slides_to_md.py --raw
 
 Rules:
   - If no positional args are provided, process all package roots in ./target_pptx.
   - Package root example: ./target_pptx/sample1
+  - If a .pptx file is provided, it is extracted automatically into ./target_pptx/<stem>/.
+  - If --raw is provided, process all .pptx files in ./raw_pptx.
   - Each package must contain: ./ppt/slides
   - Output is always written to ./output (created automatically).
   - Input slide XML order is assumed to be the final reading order.
@@ -17,10 +20,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -29,6 +35,7 @@ import xml.etree.ElementTree as ET
 
 NS = {
     "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+    "dgm": "http://schemas.openxmlformats.org/drawingml/2006/diagram",
     "p": "http://schemas.openxmlformats.org/presentationml/2006/main",
     "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
 }
@@ -38,27 +45,20 @@ REL_NS = {"rel": "http://schemas.openxmlformats.org/package/2006/relationships"}
 def run_structure_analysis_stage(
     repo_root: Path,
     slide_xmls: Sequence[Path],
-    mode: str,
-    surya_dir: Optional[Path],
 ) -> Tuple[Dict[str, Path], Path]:
-    if mode == "surya" and surya_dir is None:
-        raise ValueError("structure-analysis mode 'surya' requires --surya-dir")
-
-    ro_script = repo_root / "structure_analyzer" / "extract_reading_order_slide.py"
+    ro_script = repo_root / "structure_analyzer" / "extract_structure_analysis.py"
     if not ro_script.exists():
-        raise FileNotFoundError(f"reading_order script not found: {ro_script}")
+        raise FileNotFoundError(f"structure_analyzer script not found: {ro_script}")
 
-    ro_output = Path(tempfile.mkdtemp(prefix=f"struct_analysis_{mode}_", dir="/tmp"))
+    ro_output = Path(tempfile.mkdtemp(prefix="struct_analysis_xml_", dir="/tmp"))
     cmd = [
         "python3",
         str(ro_script),
         "--mode",
-        mode,
+        "xml",
         "--output-dir",
         str(ro_output),
     ]
-    if mode == "surya" and surya_dir is not None:
-        cmd.extend(["--surya-dir", str(surya_dir.resolve())])
     cmd.extend(str(p.resolve()) for p in slide_xmls)
 
     proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -173,6 +173,139 @@ def pick_packages(target_dirs: Sequence[Path], raw_inputs: Sequence[str]) -> Lis
     return out
 
 
+def sanitize_package_name(name: str) -> str:
+    cleaned = re.sub(r"[^0-9A-Za-z._-]+", "_", name).strip("._")
+    return cleaned or "package"
+
+
+def preferred_target_dir(cwd: Path) -> Path:
+    cands = default_target_dirs(cwd)
+    if cands:
+        return cands[0]
+    return cwd / "target_pptx"
+
+
+def raw_pptx_dir(cwd: Path) -> Path:
+    return cwd / "raw_pptx"
+
+
+def package_marker_path(pkg_dir: Path) -> Path:
+    return pkg_dir / ".pptx_source.json"
+
+
+def package_marker_matches(pkg_dir: Path, pptx_path: Path) -> bool:
+    marker = package_marker_path(pkg_dir)
+    if not marker.exists():
+        return False
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    slides_dir = pkg_dir / "ppt" / "slides"
+    if not slides_dir.exists():
+        return False
+    try:
+        stat = pptx_path.stat()
+    except OSError:
+        return False
+    return (
+        payload.get("source_path") == str(pptx_path.resolve())
+        and payload.get("size") == stat.st_size
+        and payload.get("mtime_ns") == stat.st_mtime_ns
+    )
+
+
+def safe_extract_pptx(pptx_path: Path, dest_dir: Path) -> None:
+    with zipfile.ZipFile(pptx_path) as zf:
+        for member in zf.infolist():
+            member_path = Path(member.filename)
+            if member_path.is_absolute() or ".." in member_path.parts:
+                raise ValueError(f"Unsafe archive entry: {member.filename}")
+        zf.extractall(dest_dir)
+
+
+def extract_pptx_to_target(pptx_path: Path, extraction_root: Path) -> Path:
+    stat = pptx_path.stat()
+    extraction_root.mkdir(parents=True, exist_ok=True)
+    pkg_name = sanitize_package_name(pptx_path.stem)
+    pkg_dir = extraction_root / pkg_name
+
+    if package_marker_matches(pkg_dir, pptx_path):
+        return pkg_dir.resolve()
+
+    marker = package_marker_path(pkg_dir)
+    if pkg_dir.exists():
+        if marker.exists():
+            shutil.rmtree(pkg_dir)
+        else:
+            raise FileExistsError(
+                f"target package directory already exists and is not managed by converter: {pkg_dir}"
+            )
+
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+    safe_extract_pptx(pptx_path, pkg_dir)
+
+    slides_dir = pkg_dir / "ppt" / "slides"
+    if not slides_dir.exists() or not slides_dir.is_dir():
+        shutil.rmtree(pkg_dir, ignore_errors=True)
+        raise ValueError(f"Not a valid pptx package after extraction: {pptx_path}")
+
+    marker.write_text(
+        json.dumps(
+            {
+                "source_path": str(pptx_path.resolve()),
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return pkg_dir.resolve()
+
+
+def prepare_package_inputs(cwd: Path, raw_inputs: Sequence[str]) -> List[str]:
+    if not raw_inputs:
+        return list(raw_inputs)
+
+    prepared: List[str] = []
+    extraction_root = preferred_target_dir(cwd)
+    search_roots = [cwd]
+    for root in default_target_dirs(cwd):
+        if root not in search_roots:
+            search_roots.append(root)
+
+    for item in raw_inputs:
+        p = Path(item)
+        candidates = [p]
+        for root in search_roots:
+            candidates.append(root / item)
+        picked_file: Optional[Path] = None
+        for cand in candidates:
+            if cand.exists() and cand.is_file() and cand.suffix.lower() == ".pptx":
+                picked_file = cand.resolve()
+                break
+        if picked_file is None:
+            prepared.append(item)
+            continue
+        pkg_dir = extract_pptx_to_target(picked_file, extraction_root)
+        prepared.append(str(pkg_dir))
+    return prepared
+
+
+def collect_raw_pptx_inputs(cwd: Path) -> List[str]:
+    raw_dir = raw_pptx_dir(cwd)
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    files = sorted(
+        [path.resolve() for path in raw_dir.glob("*.pptx") if path.is_file()],
+        key=lambda path: natural_key(path.name),
+    )
+    return [str(path) for path in files]
+
+
 def parse_slide_number(filename: str, default_idx: int) -> int:
     m = re.search(r"slide(\d+)", filename, re.IGNORECASE)
     if m:
@@ -278,6 +411,15 @@ def fallback_rels(slide_xml: Path) -> Optional[Path]:
     return None
 
 
+def source_slide_rels(source_slide_xml: Optional[Path]) -> Optional[Path]:
+    if source_slide_xml is None or not source_slide_xml.exists():
+        return None
+    rels = source_slide_xml.parent / "_rels" / f"{source_slide_xml.name}.rels"
+    if rels.exists() and rels.is_file():
+        return rels
+    return None
+
+
 def build_rels_map(rels_path: Optional[Path]) -> Dict[str, str]:
     if rels_path is None or not rels_path.exists():
         return {}
@@ -291,12 +433,18 @@ def build_rels_map(rels_path: Optional[Path]) -> Dict[str, str]:
     return out
 
 
-def choose_rels_in_package(slide_xml: Path) -> Optional[Path]:
+def choose_rels_in_package(
+    slide_xml: Path,
+    source_slide_xml: Optional[Path] = None,
+) -> Optional[Path]:
     # Strictly stay inside same ppt package to avoid cross-package mismatches.
     sidecar = rels_from_sidecar(slide_xml)
     if sidecar:
         return sidecar
-    return fallback_rels(slide_xml)
+    fallback = fallback_rels(slide_xml)
+    if fallback:
+        return fallback
+    return source_slide_rels(source_slide_xml)
 
 
 def resolve_image_path(
@@ -316,26 +464,244 @@ def resolve_image_path(
         return f"[unresolved-image:{r_embed}]", f"relationship not found: {r_embed}"
 
     abs_path = (rels_path.parent.parent / target).resolve()
-
-    cwd = Path.cwd().resolve()
+    repo_root = Path(__file__).resolve().parent.parent
+    pkg_name: Optional[str] = None
     try:
-        rel = abs_path.relative_to(cwd)
-        return rel.as_posix(), None
+        if rels_path.parents[2].name == "ppt":
+            pkg_name = rels_path.parents[3].name
+    except IndexError:
+        pkg_name = None
+    if pkg_name:
+        target_name = Path(target).name
+        remapped = (repo_root / "main_converter" / "target_pptx" / pkg_name / "ppt" / "media" / target_name)
+        if remapped.exists():
+            abs_path = remapped.absolute()
+    return str(abs_path), None
+
+
+def relativize_markdown_path(path: str, output_dir: Optional[Path]) -> str:
+    if path.startswith("[unresolved-image") or output_dir is None:
+        return path
+    try:
+        return os.path.relpath(path, start=str(output_dir))
+    except Exception:
+        return path
+
+
+def copy_media_asset(
+    path: str,
+    media_dir: Optional[Path],
+    copied_media: Optional[Dict[str, Path]] = None,
+) -> str:
+    if path.startswith("[unresolved-image") or media_dir is None:
+        return path
+
+    src = Path(path)
+    if not src.exists() or not src.is_file():
+        return path
+
+    try:
+        src_key = str(src.resolve())
+    except Exception:
+        src_key = str(src)
+
+    if copied_media is not None and src_key in copied_media:
+        return str(copied_media[src_key])
+
+    media_dir.mkdir(parents=True, exist_ok=True)
+    dest = media_dir / src.name
+    if dest.exists():
+        try:
+            same_file = dest.resolve() == src.resolve()
+        except Exception:
+            same_file = False
+        if not same_file:
+            stem = src.stem
+            suffix = src.suffix
+            n = 2
+            while dest.exists():
+                dest = media_dir / f"{stem}-{n}{suffix}"
+                n += 1
+
+    shutil.copy2(src, dest)
+    if copied_media is not None:
+        copied_media[src_key] = dest
+    return str(dest)
+
+
+def format_markdown_image(
+    path: str,
+    output_dir: Optional[Path],
+    alt_text: str = "image",
+    media_dir: Optional[Path] = None,
+    copied_media: Optional[Dict[str, Path]] = None,
+) -> str:
+    if path.startswith("[unresolved-image"):
+        return path
+    path = copy_media_asset(path, media_dir=media_dir, copied_media=copied_media)
+    path = relativize_markdown_path(path, output_dir)
+    return f"![{alt_text}]({path})"
+
+
+def paragraph_text(paragraph: ET.Element) -> str:
+    runs = []
+    for t in paragraph.findall(".//a:t", NS):
+        if t.text:
+            runs.append(t.text.strip())
+    return normalize_text(" ".join(x for x in runs if x))
+
+
+def paragraph_level(paragraph: ET.Element) -> Optional[int]:
+    p_pr = paragraph.find("./a:pPr", NS)
+    if p_pr is None:
+        return None
+    lvl = p_pr.attrib.get("lvl")
+    if lvl is None:
+        return None
+    try:
+        return int(lvl)
     except ValueError:
-        return str(abs_path), None
+        return None
+
+
+def paragraph_has_list_semantics(paragraph: ET.Element) -> bool:
+    p_pr = paragraph.find("./a:pPr", NS)
+    if p_pr is None:
+        return False
+    if p_pr.attrib.get("lvl") is not None:
+        return True
+    if p_pr.find("./a:buChar", NS) is not None:
+        return True
+    if p_pr.find("./a:buAutoNum", NS) is not None:
+        return True
+    return False
+
+
+def promote_plain_text_to_list(blocks: Sequence[Tuple[str, str, Optional[int]]]) -> List[Tuple[str, str, Optional[int]]]:
+    if not any(kind == "list" for kind, _, _ in blocks):
+        return list(blocks)
+
+    text_blocks = [(idx, text) for idx, (kind, text, _) in enumerate(blocks) if kind == "text"]
+    if len(text_blocks) < 3:
+        return list(blocks)
+
+    promoted = list(blocks)
+    for idx, text in text_blocks:
+        if len(text) > 80 or text.endswith((".", ":")):
+            continue
+        promoted[idx] = ("list", text, 0)
+    return promoted
+
+
+def normalize_list_levels(blocks: Sequence[Tuple[str, str, Optional[int]]]) -> List[Tuple[str, str, Optional[int]]]:
+    levels = sorted({int(level or 0) for kind, _, level in blocks if kind == "list"})
+    if not levels:
+        return list(blocks)
+    remap = {level: idx for idx, level in enumerate(levels)}
+    normalized: List[Tuple[str, str, Optional[int]]] = []
+    for kind, text, level in blocks:
+        if kind != "list":
+            normalized.append((kind, text, level))
+            continue
+        mapped = remap[int(level or 0)]
+        normalized.append((kind, text, mapped))
+    return normalized
+
+
+def extract_shape_blocks(shape_elem: ET.Element) -> List[Tuple[str, str, Optional[int]]]:
+    blocks: List[Tuple[str, str, Optional[int]]] = []
+    for p in shape_elem.findall(".//p:txBody/a:p", NS):
+        text = paragraph_text(p)
+        if not text:
+            continue
+        if paragraph_has_list_semantics(p):
+            level = paragraph_level(p)
+            blocks.append(("list", text, 0 if level is None else level))
+        else:
+            blocks.append(("text", text, None))
+    return blocks
+
+
+def render_shape_blocks(blocks: Sequence[Tuple[str, str, Optional[int]]]) -> str:
+    if not blocks:
+        return ""
+    blocks = normalize_list_levels(promote_plain_text_to_list(blocks))
+
+    rendered: List[str] = []
+    for idx, (kind, text, level) in enumerate(blocks):
+        if kind == "list":
+            indent = "  " * max(0, int(level or 0))
+            rendered.append(f"{indent}- {text}")
+            continue
+
+        prev_kind = blocks[idx - 1][0] if idx > 0 else None
+        next_kind = blocks[idx + 1][0] if idx + 1 < len(blocks) else None
+        if prev_kind == "list" and next_kind == "list":
+            rendered.append(f"- {text}")
+        else:
+            rendered.append(text)
+    return "\n".join(rendered).strip()
 
 
 def extract_shape_text(shape_elem: ET.Element) -> str:
-    paragraphs: List[str] = []
-    for p in shape_elem.findall(".//p:txBody/a:p", NS):
-        runs = []
-        for t in p.findall(".//a:t", NS):
-            if t.text:
-                runs.append(t.text.strip())
-        text = normalize_text(" ".join(x for x in runs if x))
-        if text:
-            paragraphs.append(text)
-    return "\n".join(paragraphs).strip()
+    return render_shape_blocks(extract_shape_blocks(shape_elem))
+
+
+def graphic_frame_kind(graphic_frame: ET.Element) -> Optional[str]:
+    graphic_data = graphic_frame.find("./a:graphic/a:graphicData", NS)
+    if graphic_data is None:
+        return None
+    uri = graphic_data.attrib.get("uri", "").strip()
+    if uri.endswith("/diagram"):
+        return "diagram"
+    if uri.endswith("/chart"):
+        return "chart"
+    return None
+
+
+def diagram_data_path(graphic_frame: ET.Element, rels_path: Optional[Path], rels_map: Dict[str, str]) -> Optional[Path]:
+    if rels_path is None:
+        return None
+    rel_ids = graphic_frame.find("./a:graphic/a:graphicData/dgm:relIds", NS)
+    if rel_ids is None:
+        return None
+    dm_rid = rel_ids.attrib.get(f"{{{NS['r']}}}dm")
+    if not dm_rid:
+        return None
+    target = rels_map.get(dm_rid)
+    if not target:
+        return None
+    data_path = (rels_path.parent.parent / target).resolve()
+    if data_path.exists() and data_path.is_file():
+        return data_path
+    return None
+
+
+def extract_diagram_texts(diagram_data_xml: Path) -> List[str]:
+    try:
+        root = ET.parse(diagram_data_xml).getroot()
+    except Exception:
+        return []
+
+    texts: List[str] = []
+    seen: set = set()
+    for pt in root.findall(".//dgm:pt", NS):
+        raw = "".join(t.text or "" for t in pt.findall(".//a:t", NS))
+        text = normalize_text(raw)
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        texts.append(text)
+    return texts
+
+
+def format_diagram_as_markdown(texts: Sequence[str]) -> Optional[str]:
+    cleaned = [normalize_text(text) for text in texts if normalize_text(text)]
+    if not cleaned:
+        return None
+    if len(cleaned) == 1:
+        return cleaned[0]
+    return "\n".join(f"- {text}" for text in cleaned)
 
 
 def infer_heading_depth_fallback(text: str, text_block_index: int) -> Optional[int]:
@@ -361,7 +727,288 @@ def shape_id_of(elem: ET.Element) -> str:
     return c_nv_pr.attrib.get("id", "")
 
 
-def convert_table_to_markdown(graphic_frame: ET.Element) -> Tuple[Optional[str], Optional[str]]:
+def parse_int(v: Optional[str], default: int = 10**18) -> int:
+    if v is None:
+        return default
+    try:
+        return int(v)
+    except ValueError:
+        return default
+
+
+def first_off(elem: ET.Element) -> Optional[ET.Element]:
+    for p in (
+        "./p:spPr/a:xfrm/a:off",
+        "./p:grpSpPr/a:xfrm/a:off",
+        "./p:xfrm/a:off",
+        ".//a:off",
+    ):
+        off = elem.find(p, NS)
+        if off is not None:
+            return off
+    return None
+
+
+def first_ext(elem: ET.Element) -> Optional[ET.Element]:
+    for p in (
+        "./p:spPr/a:xfrm/a:ext",
+        "./p:grpSpPr/a:xfrm/a:ext",
+        "./p:xfrm/a:ext",
+        ".//a:ext",
+    ):
+        ext = elem.find(p, NS)
+        if ext is not None:
+            return ext
+    return None
+
+
+def extract_bbox_emu(elem: ET.Element) -> Optional[Tuple[int, int, int, int]]:
+    off = first_off(elem)
+    ext = first_ext(elem)
+    if off is None or ext is None:
+        return None
+    x = parse_int(off.attrib.get("x"))
+    y = parse_int(off.attrib.get("y"))
+    w = parse_int(ext.attrib.get("cx"))
+    h = parse_int(ext.attrib.get("cy"))
+    if any(v >= 10**18 for v in (x, y, w, h)) or w <= 0 or h <= 0:
+        return None
+    return (x, y, x + w, y + h)
+
+
+def intersection_area(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> int:
+    left = max(a[0], b[0])
+    top = max(a[1], b[1])
+    right = min(a[2], b[2])
+    bottom = min(a[3], b[3])
+    if right <= left or bottom <= top:
+        return 0
+    return (right - left) * (bottom - top)
+
+
+def bbox_area(bbox: Tuple[int, int, int, int]) -> int:
+    return max(0, bbox[2] - bbox[0]) * max(0, bbox[3] - bbox[1])
+
+
+def bbox_center(bbox: Tuple[int, int, int, int]) -> Tuple[int, int]:
+    return ((bbox[0] + bbox[2]) // 2, (bbox[1] + bbox[3]) // 2)
+
+
+def bbox_contains_point(bbox: Tuple[int, int, int, int], point: Tuple[int, int]) -> bool:
+    return bbox[0] <= point[0] <= bbox[2] and bbox[1] <= point[1] <= bbox[3]
+
+
+def overlay_link_text(
+    path: str,
+    output_dir: Optional[Path],
+    media_dir: Optional[Path] = None,
+    copied_media: Optional[Dict[str, Path]] = None,
+) -> str:
+    if path.startswith("[unresolved-image"):
+        return path
+    path = copy_media_asset(path, media_dir=media_dir, copied_media=copied_media)
+    path = relativize_markdown_path(path, output_dir)
+    return f"[image]({path})"
+
+
+def collect_table_overlay_pictures(
+    sp_tree: ET.Element,
+    slide_xml: Path,
+    rels_map: Dict[str, str],
+    rels_path: Optional[Path],
+) -> Tuple[Dict[str, List[Dict[str, object]]], set, List[str], int, int]:
+    table_bboxes: List[Tuple[str, Tuple[int, int, int, int]]] = []
+    picture_infos: List[Dict[str, object]] = []
+
+    for child in list(sp_tree):
+        tag = local_name(child.tag)
+        if tag == "graphicFrame":
+            tbl = child.find(".//a:tbl", NS)
+            bbox = extract_bbox_emu(child)
+            sid = shape_id_of(child)
+            if tbl is not None and bbox is not None and sid:
+                table_bboxes.append((sid, bbox))
+        elif tag == "pic":
+            bbox = extract_bbox_emu(child)
+            sid = shape_id_of(child)
+            if bbox is None or not sid:
+                continue
+            blip = child.find(".//a:blip", NS)
+            embed = blip.attrib.get(f"{{{NS['r']}}}embed") if blip is not None else None
+            path, warn = resolve_image_path(slide_xml, rels_map, rels_path, embed)
+            picture_infos.append(
+                {
+                    "shape_id": sid,
+                    "bbox": bbox,
+                    "path": path,
+                    "warn": warn,
+                }
+            )
+
+    by_table: Dict[str, List[Dict[str, object]]] = {}
+    consumed: set = set()
+    warnings: List[str] = []
+    resolved = 0
+    unresolved = 0
+    for _, table_bbox in table_bboxes:
+        table_area = bbox_area(table_bbox)
+        if table_area <= 0:
+            continue
+        for pic_info in picture_infos:
+            pic_id = str(pic_info["shape_id"])
+            pic_bbox = pic_info["bbox"]
+            pic_area = bbox_area(pic_bbox)
+            if pic_area <= 0:
+                continue
+            overlap = intersection_area(table_bbox, pic_bbox)
+            overlap_ratio = overlap / pic_area
+            center_inside = bbox_contains_point(table_bbox, bbox_center(pic_bbox))
+            if center_inside and overlap_ratio >= 0.8:
+                consumed.add(pic_id)
+                by_table.setdefault(_, []).append(pic_info)
+                warn = pic_info.get("warn")
+                if isinstance(warn, str) and warn:
+                    unresolved += 1
+                    warnings.append(warn)
+                else:
+                    resolved += 1
+    return by_table, consumed, warnings, resolved, unresolved
+
+
+def compute_table_cell_bounds(
+    graphic_frame: ET.Element,
+) -> Optional[Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]]:
+    bbox = extract_bbox_emu(graphic_frame)
+    tbl = graphic_frame.find(".//a:tbl", NS)
+    if bbox is None or tbl is None:
+        return None
+
+    col_elems = tbl.findall("./a:tblGrid/a:gridCol", NS)
+    row_elems = tbl.findall("./a:tr", NS)
+    col_widths = [parse_int(col.attrib.get("w"), 0) for col in col_elems]
+    row_heights = [parse_int(row.attrib.get("h"), 0) for row in row_elems]
+    total_col = sum(v for v in col_widths if v > 0)
+    total_row = sum(v for v in row_heights if v > 0)
+    if total_col <= 0 or total_row <= 0:
+        return None
+
+    table_width = bbox[2] - bbox[0]
+    table_height = bbox[3] - bbox[1]
+    if table_width <= 0 or table_height <= 0:
+        return None
+
+    col_bounds: List[Tuple[int, int]] = []
+    cursor = bbox[0]
+    used_width = 0
+    for idx, width in enumerate(col_widths):
+        if idx == len(col_widths) - 1:
+            right = bbox[2]
+        else:
+            used_width += width
+            right = bbox[0] + int(table_width * used_width / total_col)
+        col_bounds.append((cursor, right))
+        cursor = right
+
+    row_bounds: List[Tuple[int, int]] = []
+    cursor = bbox[1]
+    used_height = 0
+    for idx, height in enumerate(row_heights):
+        if idx == len(row_heights) - 1:
+            bottom = bbox[3]
+        else:
+            used_height += height
+            bottom = bbox[1] + int(table_height * used_height / total_row)
+        row_bounds.append((cursor, bottom))
+        cursor = bottom
+
+    return col_bounds, row_bounds
+
+
+def find_table_cell_origin(
+    parsed_table: Dict[str, object],
+    row_idx: int,
+    col_idx: int,
+) -> Tuple[int, int]:
+    rows = parsed_table.get("rows")
+    if not isinstance(rows, list):
+        return row_idx, col_idx
+    if row_idx >= len(rows):
+        return row_idx, col_idx
+    row = rows[row_idx]
+    if not isinstance(row, list) or col_idx >= len(row):
+        return row_idx, col_idx
+    cell = row[col_idx]
+    if not isinstance(cell, dict):
+        return row_idx, col_idx
+    origin = cell.get("origin")
+    if cell.get("type") in {"hMerge", "vMerge"} and isinstance(origin, list) and len(origin) == 2:
+        if isinstance(origin[0], int) and isinstance(origin[1], int):
+            return origin[0], origin[1]
+    return row_idx, col_idx
+
+
+def inject_table_overlay_links(
+    parsed_table: Dict[str, object],
+    graphic_frame: ET.Element,
+    overlays: Sequence[Dict[str, object]],
+    output_dir: Optional[Path],
+    media_dir: Optional[Path] = None,
+    copied_media: Optional[Dict[str, Path]] = None,
+) -> Dict[str, object]:
+    if not overlays:
+        return parsed_table
+
+    bounds = compute_table_cell_bounds(graphic_frame)
+    if bounds is None:
+        return parsed_table
+    col_bounds, row_bounds = bounds
+
+    rows = parsed_table.get("rows")
+    if not isinstance(rows, list):
+        return parsed_table
+
+    for overlay in overlays:
+        bbox = overlay.get("bbox")
+        if not (isinstance(bbox, tuple) and len(bbox) == 4):
+            continue
+        center = bbox_center(bbox)
+        row_idx = next((idx for idx, (top, bottom) in enumerate(row_bounds) if top <= center[1] <= bottom), None)
+        col_idx = next((idx for idx, (left, right) in enumerate(col_bounds) if left <= center[0] <= right), None)
+        if row_idx is None or col_idx is None:
+            continue
+        origin_row, origin_col = find_table_cell_origin(parsed_table, row_idx, col_idx)
+        if origin_row >= len(rows):
+            continue
+        row = rows[origin_row]
+        if not isinstance(row, list) or origin_col >= len(row):
+            continue
+        cell = row[origin_col]
+        if not isinstance(cell, dict):
+            continue
+        existing = normalize_text(str(cell.get("text", "")))
+        link = overlay_link_text(
+            str(overlay.get("path", "")),
+            output_dir,
+            media_dir=media_dir,
+            copied_media=copied_media,
+        )
+        updated = f"{existing}\n{link}".strip() if existing else link
+        cell["text"] = updated
+
+    return parsed_table
+
+
+def table_overlay_picture_ids(sp_tree: ET.Element) -> set:
+    return set()
+
+
+def convert_table_to_markdown(
+    graphic_frame: ET.Element,
+    overlays: Optional[Sequence[Dict[str, object]]] = None,
+    output_dir: Optional[Path] = None,
+    media_dir: Optional[Path] = None,
+    copied_media: Optional[Dict[str, Path]] = None,
+) -> Tuple[Optional[str], Optional[str]]:
     tbl = graphic_frame.find(".//a:tbl", NS)
     if tbl is None:
         return None, "graphicFrame without a:tbl"
@@ -373,6 +1020,14 @@ def convert_table_to_markdown(graphic_frame: ET.Element) -> Tuple[Optional[str],
         tmp.write(ET.tostring(tbl, encoding="utf-8"))
         tmp.flush()
         parsed = parse_table.parse_table_xml(Path(tmp.name))
+        parsed = inject_table_overlay_links(
+            parsed,
+            graphic_frame,
+            overlays or [],
+            output_dir,
+            media_dir=media_dir,
+            copied_media=copied_media,
+        )
         dense = tableMaker._dense_grid_from_parsed_table(parsed, fill_merged=tableMaker.FILL_BOTH)
         md = tableMaker._render_markdown_flat(dense=dense, header_rows=1, use_header_rows=True)
     return md, None
@@ -381,15 +1036,22 @@ def convert_table_to_markdown(graphic_frame: ET.Element) -> Tuple[Optional[str],
 def convert_one_slide(
     slide_xml: Path,
     page_no: int,
+    source_slide_xml: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
+    media_dir: Optional[Path] = None,
+    copied_media: Optional[Dict[str, Path]] = None,
 ) -> Tuple[str, Dict[str, object]]:
     root = ET.parse(slide_xml).getroot()
     sp_tree = root.find("p:cSld/p:spTree", NS)
     if sp_tree is None:
         raise ValueError("missing p:cSld/p:spTree")
 
-    rels_path = choose_rels_in_package(slide_xml)
+    rels_path = choose_rels_in_package(slide_xml, source_slide_xml=source_slide_xml)
     rels_map = build_rels_map(rels_path)
     heading_hints = load_heading_hints(slide_xml)
+    table_overlay_map, consumed_picture_ids, overlay_warnings, overlay_resolved, overlay_unresolved = (
+        collect_table_overlay_pictures(sp_tree, slide_xml, rels_map, rels_path)
+    )
 
     lines: List[str] = [f"[Page_{page_no}]", ""]
     used_headings: set = set()
@@ -404,9 +1066,11 @@ def convert_one_slide(
         "skipped_blocks": 0,
         "resolved_images": 0,
         "unresolved_images": 0,
-        "warnings": [],
+        "warnings": list(overlay_warnings),
         "rels_path": str(rels_path) if rels_path else None,
     }
+    stats["resolved_images"] += overlay_resolved
+    stats["unresolved_images"] += overlay_unresolved
 
     for child in list(sp_tree):
         tag = local_name(child.tag)
@@ -463,6 +1127,10 @@ def convert_one_slide(
             continue
 
         if tag == "pic":
+            sid = shape_id_of(child)
+            if sid and sid in consumed_picture_ids:
+                stats["skipped_blocks"] += 1
+                continue
             blip = child.find(".//a:blip", NS)
             embed = blip.attrib.get(f"{{{NS['r']}}}embed") if blip is not None else None
             img_path, warn = resolve_image_path(slide_xml, rels_map, rels_path, embed)
@@ -471,27 +1139,138 @@ def convert_one_slide(
                 stats["warnings"].append(warn)
             else:
                 stats["resolved_images"] += 1
-            lines.append(f'[img(src="{img_path}")]')
+            lines.append(
+                format_markdown_image(
+                    img_path,
+                    output_dir=output_dir,
+                    media_dir=media_dir,
+                    copied_media=copied_media,
+                )
+            )
             lines.append("")
             stats["image_blocks"] += 1
             continue
 
         if tag == "graphicFrame":
-            table_md, err = convert_table_to_markdown(child)
+            table_md, err = convert_table_to_markdown(
+                child,
+                overlays=table_overlay_map.get(shape_id_of(child), []),
+                output_dir=output_dir,
+                media_dir=media_dir,
+                copied_media=copied_media,
+            )
             if table_md is not None:
                 lines.append(table_md.strip())
                 lines.append("")
                 stats["table_blocks"] += 1
             else:
-                lines.append("[unsupported: graphicFrame(non-table)]")
-                lines.append("")
-                stats["unsupported_blocks"] += 1
+                gf_kind = graphic_frame_kind(child)
+                if gf_kind == "diagram":
+                    diagram_path = diagram_data_path(child, rels_path, rels_map)
+                    diagram_text = format_diagram_as_markdown(
+                        extract_diagram_texts(diagram_path) if diagram_path else []
+                    )
+                    if diagram_text:
+                        lines.append(diagram_text)
+                        lines.append("")
+                        stats["text_blocks"] += 1
+                    else:
+                        lines.append("[unsupported: graphicFrame(non-table)]")
+                        lines.append("")
+                        stats["unsupported_blocks"] += 1
+                        stats["warnings"].append("diagram text extraction failed")
+                else:
+                    lines.append("[unsupported: graphicFrame(non-table)]")
+                    lines.append("")
+                    stats["unsupported_blocks"] += 1
                 if err:
                     stats["warnings"].append(err)
             continue
 
     md_text = "\n".join(lines).rstrip() + "\n"
     return md_text, stats
+
+
+def resolve_surya_structure_dir(surya_root: Path, package_name: str) -> Path:
+    manifest_here = surya_root / "structure_analysis_manifest.json"
+    if manifest_here.exists():
+        return surya_root
+    candidate = surya_root / package_name
+    manifest_there = candidate / "structure_analysis_manifest.json"
+    if manifest_there.exists():
+        return candidate
+    raise FileNotFoundError(
+        f"surya structure-ready output not found for package '{package_name}' under {surya_root}"
+    )
+
+
+def run_surya_pipeline_stage(
+    repo_root: Path,
+    surya_root: Path,
+    force: bool = False,
+) -> Path:
+    run_script = repo_root / "surya_pipeline" / "run_surya_pipeline.py"
+    if not run_script.exists():
+        raise FileNotFoundError(f"surya pipeline script not found: {run_script}")
+
+    cmd = [
+        sys.executable,
+        str(run_script),
+        "--surya-dir",
+        str(surya_root),
+    ]
+    if force:
+        cmd.append("--force")
+
+    print(f"[surya] Running pipeline: {' '.join(cmd)}")
+    proc = subprocess.run(cmd, text=True, cwd=str(repo_root))
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "surya pipeline failed\n"
+            f"cmd: {' '.join(cmd)}\n"
+        )
+    structure_root = surya_root / "output" / "structure_ready"
+    if not structure_root.exists() or not structure_root.is_dir():
+        raise FileNotFoundError(f"surya structure-ready output not found after pipeline run: {structure_root}")
+    return structure_root
+
+
+def prepare_surya_structure_root(
+    repo_root: Path,
+    raw_surya_dir: Optional[Path],
+    force: bool = False,
+    use_existing_output: bool = False,
+) -> Path:
+    if raw_surya_dir is None:
+        candidate = repo_root / "surya_pipeline"
+    else:
+        candidate = raw_surya_dir
+
+    if use_existing_output:
+        # Structure-ready dir passed directly.
+        if (candidate / "structure_analysis_manifest.json").exists():
+            return candidate
+        # Package subdirs under structure_ready root.
+        if candidate.name == "structure_ready" and candidate.exists() and candidate.is_dir():
+            return candidate
+        structure_root = candidate / "output" / "structure_ready"
+        if structure_root.exists() and structure_root.is_dir():
+            return structure_root
+
+    # Surya pipeline root passed in or inferred.
+    if (candidate / "run_surya_pipeline.py").exists():
+        return run_surya_pipeline_stage(repo_root=repo_root, surya_root=candidate, force=force)
+
+    if use_existing_output:
+        structure_root = candidate / "output" / "structure_ready"
+        if structure_root.exists() and structure_root.is_dir():
+            return structure_root
+
+    raise FileNotFoundError(
+        "valid surya input not found. Pass surya_pipeline root, or use --use-existing-surya-output "
+        "with output/structure_ready: "
+        f"{candidate}"
+    )
 
 
 def main() -> int:
@@ -501,7 +1280,17 @@ def main() -> int:
     parser.add_argument(
         "inputs",
         nargs="*",
-        help="Package root dir(s). If omitted, process ./target_pptx/*.",
+        help="Package root dir(s) or .pptx file(s). If omitted, process ./target_pptx/*.",
+    )
+    parser.add_argument(
+        "--raw",
+        action="store_true",
+        help="Process all .pptx files in ./raw_pptx by extracting them into ./target_pptx first.",
+    )
+    parser.add_argument(
+        "--per-slide",
+        action="store_true",
+        help="Also write per-slide markdown files under ./output/.../<package>/per_slide.",
     )
     parser.add_argument(
         "--reading-order",
@@ -512,20 +1301,54 @@ def main() -> int:
     parser.add_argument(
         "--surya-dir",
         default=None,
-        help="Directory containing Surya per-slide JSON outputs (required when --reading-order surya).",
+        help="Path to surya_pipeline root. If omitted, defaults to ../surya_pipeline.",
+    )
+    parser.add_argument(
+        "--force-surya-pipeline",
+        action="store_true",
+        help="Deprecated alias. Surya mode now re-runs the pipeline by default.",
+    )
+    parser.add_argument(
+        "--reuse-surya-cache",
+        action="store_true",
+        help="Reuse existing Surya outputs instead of re-running the pipeline.",
+    )
+    parser.add_argument(
+        "--use-existing-surya-output",
+        action="store_true",
+        help="Use existing output/structure_ready instead of running the Surya pipeline.",
     )
     args = parser.parse_args()
+    if args.raw and args.inputs:
+        parser.error("--raw cannot be used together with positional inputs.")
 
     cwd = Path.cwd()
-    output_dir = cwd / "output"
+    output_root = cwd / "output"
+    output_dir = output_root / args.reading_order
     output_dir.mkdir(parents=True, exist_ok=True)
 
     repo_root = Path(__file__).resolve().parent.parent
     ensure_imports(repo_root)
+    if args.raw:
+        raw_inputs = collect_raw_pptx_inputs(cwd)
+        if not raw_inputs:
+            print(f"No .pptx files found in: {raw_pptx_dir(cwd).resolve()}")
+            return 0
+        prepared_inputs = prepare_package_inputs(cwd, raw_inputs)
+    else:
+        prepared_inputs = prepare_package_inputs(cwd, args.inputs)
     surya_dir = Path(args.surya_dir).resolve() if args.surya_dir else None
+    surya_structure_root: Optional[Path] = None
+    if args.reading_order == "surya":
+        surya_structure_root = prepare_surya_structure_root(
+            repo_root=repo_root,
+            raw_surya_dir=surya_dir,
+            force=(not args.reuse_surya_cache) or args.force_surya_pipeline,
+            use_existing_output=args.use_existing_surya_output,
+        )
 
     target_dirs = default_target_dirs(cwd)
-    packages = pick_packages(target_dirs, args.inputs)
+    packages = pick_packages(target_dirs, prepared_inputs)
     if not packages:
         print("No valid PPTX package directories found.")
         if target_dirs:
@@ -558,44 +1381,72 @@ def main() -> int:
         )
         pkg_out = output_dir / pkg_name
         per_slide_dir = pkg_out / "per_slide"
+        media_dir = pkg_out / "media"
+        copied_media: Dict[str, Path] = {}
         pkg_out.mkdir(parents=True, exist_ok=True)
-        per_slide_dir.mkdir(parents=True, exist_ok=True)
+        if args.per_slide:
+            per_slide_dir.mkdir(parents=True, exist_ok=True)
+        elif per_slide_dir.exists():
+            shutil.rmtree(per_slide_dir)
 
         pkg_row = {
             "package": str(pkg),
             "name": pkg_name,
             "slides": [],
             "result_md": str(pkg_out / "result.md"),
-            "structure_analysis_mode": args.reading_order,
+            "pipeline_mode": args.reading_order,
         }
 
         all_chunks: List[str] = []
-        try:
-            ro_map, ro_output = run_structure_analysis_stage(
-                repo_root=repo_root,
-                slide_xmls=slide_xmls,
-                mode=args.reading_order,
-                surya_dir=surya_dir,
-            )
-            pkg_row["structure_analysis_output_dir"] = str(ro_output)
-        except Exception as e:  # noqa: BLE001
-            for slide_xml in slide_xmls:
-                row = {
-                    "page": parse_slide_number(slide_xml.name, 0),
-                    "source_xml": str(slide_xml),
-                    "status": "failed",
-                    "error": f"structure_analysis stage failed: {e}",
-                    "warnings": [],
-                }
-                pkg_row["slides"].append(row)
-                manifest["summary"]["failed"] += 1
-            manifest["packages"].append(pkg_row)
-            print(f"[{pkg_name}] structure_analysis failed: {e}")
-            continue
+        ro_map: Dict[str, Path] = {}
+        structure_output_dir: Optional[Path] = None
+        if args.reading_order == "xml":
+            try:
+                ro_map, ro_output = run_structure_analysis_stage(
+                    repo_root=repo_root,
+                    slide_xmls=slide_xmls,
+                )
+                pkg_row["structure_analysis_output_dir"] = str(ro_output)
+            except Exception as e:  # noqa: BLE001
+                for slide_xml in slide_xmls:
+                    row = {
+                        "page": parse_slide_number(slide_xml.name, 0),
+                        "source_xml": str(slide_xml),
+                        "status": "failed",
+                        "error": f"structure_analysis stage failed: {e}",
+                        "warnings": [],
+                    }
+                    pkg_row["slides"].append(row)
+                    manifest["summary"]["failed"] += 1
+                manifest["packages"].append(pkg_row)
+                print(f"[{pkg_name}] structure_analysis failed: {e}")
+                continue
+        else:
+            try:
+                structure_output_dir = (
+                    resolve_surya_structure_dir(surya_structure_root, pkg_name) if surya_structure_root else None
+                )
+                pkg_row["structure_analysis_output_dir"] = str(structure_output_dir)
+            except Exception as e:  # noqa: BLE001
+                for slide_xml in slide_xmls:
+                    row = {
+                        "page": parse_slide_number(slide_xml.name, 0),
+                        "source_xml": str(slide_xml),
+                        "status": "failed",
+                        "error": f"surya structure-ready stage failed: {e}",
+                        "warnings": [],
+                    }
+                    pkg_row["slides"].append(row)
+                    manifest["summary"]["failed"] += 1
+                manifest["packages"].append(pkg_row)
+                print(f"[{pkg_name}] surya structure-ready failed: {e}")
+                continue
 
         for i, slide_xml in enumerate(slide_xmls, 1):
             page_no = parse_slide_number(slide_xml.name, i)
             ordered_slide_xml = ro_map.get(str(slide_xml.resolve()), slide_xml)
+            if args.reading_order == "surya" and structure_output_dir is not None:
+                ordered_slide_xml = structure_output_dir / f"{slide_xml.stem}.reordered.xml"
             row = {
                 "page": page_no,
                 "source_xml": str(slide_xml),
@@ -604,15 +1455,34 @@ def main() -> int:
                 "warnings": [],
             }
             try:
-                md_text, stats = convert_one_slide(ordered_slide_xml, page_no)
-                out_md = per_slide_dir / f"{slide_xml.stem}.md"
-                out_md.write_text(md_text, encoding="utf-8")
-                all_chunks.append(md_text.rstrip())
+                if not ordered_slide_xml.exists():
+                    raise FileNotFoundError(f"reordered slide xml not found: {ordered_slide_xml}")
+                merged_md_text, stats = convert_one_slide(
+                    ordered_slide_xml,
+                    page_no,
+                    source_slide_xml=(slide_xml if args.reading_order == "surya" else None),
+                    output_dir=pkg_out,
+                    media_dir=media_dir,
+                    copied_media=copied_media,
+                )
+                if args.reading_order == "surya":
+                    row["surya_source"] = str(structure_output_dir)
+                if args.per_slide:
+                    md_text, _ = convert_one_slide(
+                        ordered_slide_xml,
+                        page_no,
+                        source_slide_xml=(slide_xml if args.reading_order == "surya" else None),
+                        output_dir=per_slide_dir,
+                        media_dir=media_dir,
+                        copied_media=copied_media,
+                    )
+                    out_md = per_slide_dir / f"{slide_xml.stem}.md"
+                    out_md.write_text(md_text, encoding="utf-8")
+                all_chunks.append(merged_md_text.rstrip())
 
                 row.update(
                     {
                         "status": "ok",
-                        "output_md": str(out_md),
                         "blocks_total": stats["blocks_total"],
                         "text_blocks": stats["text_blocks"],
                         "image_blocks": stats["image_blocks"],
@@ -623,6 +1493,8 @@ def main() -> int:
                         "warnings": stats["warnings"],
                     }
                 )
+                if args.per_slide:
+                    row["output_md"] = str(out_md)
                 manifest["summary"]["processed_slides"] += 1
                 manifest["summary"]["resolved_images"] += stats["resolved_images"]
                 manifest["summary"]["unresolved_images"] += stats["unresolved_images"]

@@ -13,3 +13,18 @@
 !/README.md
 !/README.eg.md
 .venv
+
+# Sensitive source PPTX and generated artifacts (must not be published)
+/main_converter/raw_pptx/
+/main_converter/target_pptx/
+/main_converter/output/
+/surya_pipeline/target_pptx/
+/surya_pipeline/target_pdf/
+/surya_pipeline/output/
+*.pptx
+*.ppt
+*.pdf
+
+# Python cache
+__pycache__/
+*.py[cod]
