@@ -1,79 +1,96 @@
-# PPTX table to Markdown table Converter
+# pptx2markdown
 
-PPTX 슬라이드 XML에서 테이블 XML을 추출하고, 이를 그리드 JSON으로 변환하는 유틸리티입니다.
+PPTX(또는 PPTX 추출 패키지)를 Markdown으로 변환하는 파이프라인입니다.  
+현재 문서는 `surya_pipeline`을 제외한 기본(XML 기반) 파이프라인 기준입니다.
 
-## 스크립트
+## 전체 파이프라인
 
-- `table_extractor/extract_table.py`
-  - 슬라이드 XML에서 `<a:tbl>` 노드를 추출합니다.
-  - 출력: `table_extractor/extract_results/<slide_stem>_0001.xml`, ...
+기본 엔드투엔드 실행은 `main_converter`가 담당합니다.
 
-- `table_parser/parse_table.py`
-  - 추출된 테이블 XML을 JSON 그리드 형태로 파싱합니다.
-  - 출력: `table_parser/parsing_results/<input_stem>_grid.json`
+1. 입력 수집
+2. 슬라이드 구조 분석(`structure_analyzer`)
+3. 슬라이드별 텍스트/이미지/테이블 변환
+4. 패키지 단위 Markdown 결과 및 manifest 출력
 
-- `table_parser/tableMaker.py`
-  - 테이블 JSON을 Markdown/HTML/CSV로 렌더링합니다.
-  - 배치(인자 없음) 실행 시 `table_parser/parsing_results/*.json`을
-    `table_parser/tables/*.md`로 변환합니다.
+## 모듈 구성
 
-## 요구사항
+- `main_converter`
+  - 역할: 전체 변환 오케스트레이션, 최종 Markdown 생성
+  - 상세: `main_converter/README.md`
+- `structure_analyzer`
+  - 역할: 슬라이드 객체 읽기 순서 분석, reordered XML 생성
+  - 상세: `structure_analyzer/README.md`
+- `table_extractor`
+  - 역할: 슬라이드 XML에서 `<a:tbl>` 추출
+  - 상세: `table_extractor/README.md`
+- `table_parser`
+  - 역할: 테이블 XML을 JSON으로 파싱하고 Markdown/HTML/CSV 렌더링
+  - 상세: `table_parser/README.md`
 
-- Python 3.10+ (권장 3.11+)
+## 입력/출력 요약
 
-## 사용법
+- 주요 입력
+  - `main_converter/raw_pptx/*.pptx`
+  - 또는 `main_converter/target_pptx/<package>/ppt/slides/slide*.xml`
+- 주요 출력
+  - `main_converter/output/xml/<package>/result.md`
+  - `main_converter/output/xml/convert_manifest.json`
+  - `main_converter/output/xml/<package>/media/*`
+  - (옵션) `main_converter/output/xml/<package>/per_slide/slideN.md`
 
-### 1) 테이블 XML 추출
+## 빠른 사용법
 
-특정 파일 지정 실행:
+`main_converter` 디렉터리 기준으로 실행합니다.
+
+### 1) raw_pptx 일괄 변환
 
 ```bash
-python3 table_extractor/extract_table.py table_extractor/target_slides/slide2.xml table_extractor/target_slides/slide10.xml
+cd main_converter
+python3 convert_slides_to_md.py --raw --reading-order xml
 ```
 
-인자 없이 실행(기본 모드):
+### 2) target_pptx 패키지 일괄 변환
 
+```bash
+cd main_converter
+python3 convert_slides_to_md.py --reading-order xml
+```
+
+### 3) 특정 패키지만 변환
+
+```bash
+cd main_converter
+python3 convert_slides_to_md.py target_pptx/sample1 --reading-order xml
+```
+
+### 4) 슬라이드별 파일도 같이 생성
+
+```bash
+cd main_converter
+python3 convert_slides_to_md.py --raw --reading-order xml --per-slide
+```
+
+## 수동 테이블 파이프라인(선택)
+
+테이블만 따로 검증/가공할 때 사용합니다.
+
+1. 추출
 ```bash
 python3 table_extractor/extract_table.py
 ```
 
-기본 모드에서는 `table_extractor/target_slides/`의 모든 `*.xml`을 처리합니다.
-
-### 2) 테이블 XML -> JSON 파싱
-
-특정 추출 XML 지정 실행:
-
-```bash
-python3 table_parser/parse_table.py table_extractor/extract_results/slide2_0001.xml table_extractor/extract_results/slide10_0001.xml
-```
-
-인자 없이 실행(기본 모드):
-
+2. 파싱
 ```bash
 python3 table_parser/parse_table.py
 ```
 
-기본 모드에서는 `table_extractor/extract_results/`의 모든 `*.xml`을 처리합니다.
-
-### 3) JSON -> 테이블 렌더링 (`tableMaker.py`)
-
-단일 JSON 파일 변환:
-
-```bash
-python3 table_parser/tableMaker.py table_parser/parsing_results/slide2_0001_grid.json
-```
-
-인자 없이 실행(배치 모드):
-
+3. 렌더링
 ```bash
 python3 table_parser/tableMaker.py
 ```
 
-배치 모드에서는 `table_parser/parsing_results/*.json`(manifest 제외)을
-`table_parser/tables/*.md`로 변환합니다.
-
 ## 참고
 
-- 진행 로그는 `SCRIPT`와 `WRITE` 단계로 구분되어 출력됩니다.
-- 출력 폴더가 없으면 자동 생성됩니다.
-- 각 출력 폴더에는 `manifest.json`이 생성됩니다.
+- Python 3.10+ 권장
+- 경로는 상대경로 기준으로 작성되어 있습니다.
+- `surya_pipeline` 관련 옵션/흐름은 이 README 범위에서 제외했습니다.
