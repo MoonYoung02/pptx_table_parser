@@ -25,6 +25,38 @@
 *.ppt
 *.pdf
 
+# Keep empty input/output directory skeletons in git (.gitkeep only)
+!/main_converter/raw_pptx/
+/main_converter/raw_pptx/*
+!/main_converter/raw_pptx/.gitkeep
+!/main_converter/target_pptx/
+/main_converter/target_pptx/*
+!/main_converter/target_pptx/.gitkeep
+!/main_converter/target_slides/
+/main_converter/target_slides/*
+!/main_converter/target_slides/.gitkeep
+!/main_converter/output/
+/main_converter/output/*
+!/main_converter/output/.gitkeep
+!/structure_analyzer/target_slides/
+/structure_analyzer/target_slides/*
+!/structure_analyzer/target_slides/.gitkeep
+!/structure_analyzer/output/
+/structure_analyzer/output/*
+!/structure_analyzer/output/.gitkeep
+!/table_extractor/target_slides/
+/table_extractor/target_slides/*
+!/table_extractor/target_slides/.gitkeep
+!/table_extractor/extract_results/
+/table_extractor/extract_results/*
+!/table_extractor/extract_results/.gitkeep
+!/table_parser/parsing_results/
+/table_parser/parsing_results/*
+!/table_parser/parsing_results/.gitkeep
+!/table_parser/tables/
+/table_parser/tables/*
+!/table_parser/tables/.gitkeep
+
 # Python cache
 __pycache__/
 *.py[cod]
