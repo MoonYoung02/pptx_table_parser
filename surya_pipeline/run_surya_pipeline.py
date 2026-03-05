@@ -100,8 +100,18 @@ def main() -> int:
     output_norm = surya_dir / "output" / "normalized"
     output_struct = surya_dir / "output" / "structure_ready"
 
-    if not target_pptx.exists():
-        raise FileNotFoundError(f"target_pptx not found: {target_pptx}")
+    for required_dir in [
+        target_pptx,
+        target_pdf,
+        output_layout,
+        output_ocr,
+        output_table,
+        output_norm,
+        output_struct,
+    ]:
+        if required_dir.exists() and not required_dir.is_dir():
+            raise NotADirectoryError(f"required path exists but is not a directory: {required_dir}")
+        required_dir.mkdir(parents=True, exist_ok=True)
 
     # Step 1: PPTX -> PDF
     print("[1/4] Converting PPTX to PDF...")

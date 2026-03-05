@@ -108,15 +108,16 @@ def ensure_imports(repo_root: Path) -> None:
 
 
 def default_target_dirs(cwd: Path) -> List[Path]:
-    # Prefer local main_converter/target_pptx, then fallback to parent-level.
-    cands = [
-        cwd / "target_pptx",
-        cwd.parent / "target_pptx",
-    ]
-    out: List[Path] = []
-    for c in cands:
-        if c.exists() and c.is_dir():
-            out.append(c)
+    # Prefer local main_converter/target_pptx. Create it when absent.
+    local_target = cwd / "target_pptx"
+    if local_target.exists() and not local_target.is_dir():
+        raise NotADirectoryError(f"target_pptx path exists but is not a directory: {local_target}")
+    local_target.mkdir(parents=True, exist_ok=True)
+
+    out: List[Path] = [local_target]
+    parent_target = cwd.parent / "target_pptx"
+    if parent_target.exists() and parent_target.is_dir() and parent_target != local_target:
+        out.append(parent_target)
     return out
 
 

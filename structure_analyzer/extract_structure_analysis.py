@@ -753,8 +753,9 @@ def gather_input_files(target_dir: Path, raw_inputs: Sequence[str]) -> List[Path
                 continue
             files.append(selected.resolve())
     else:
-        if not target_dir.exists():
-            return []
+        if target_dir.exists() and not target_dir.is_dir():
+            raise NotADirectoryError(f"target_slides path exists but is not a directory: {target_dir}")
+        target_dir.mkdir(parents=True, exist_ok=True)
         files = sorted(target_dir.glob("*.xml"), key=natural_key)
         files = [f.resolve() for f in files if f.is_file()]
 

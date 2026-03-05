@@ -84,9 +84,11 @@ def main() -> int:
     input_dir = Path(args.input_dir).resolve()
     output_dir = Path(args.output_dir).resolve()
 
-    if not input_dir.exists() or not input_dir.is_dir():
-        print(f"[ERROR] input directory not found: {input_dir}")
+    if input_dir.exists() and not input_dir.is_dir():
+        print(f"[ERROR] input path exists but is not a directory: {input_dir}")
         return 1
+    input_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     soffice_cmd = resolve_soffice_cmd()
     if not soffice_cmd:
@@ -98,8 +100,6 @@ def main() -> int:
     if not pptx_files:
         print(f"[INFO] no .pptx files found in: {input_dir}")
         return 0
-
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     failed = 0
     for pptx in pptx_files:
